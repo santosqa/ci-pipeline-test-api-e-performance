@@ -1,0 +1,292 @@
+name: Testes manuais
+run-name: ${{ inputs.suite == 'api' && 'API Tests' || 'Performance Tests - JMeter' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Qual conjunto de testes executar?
+        required: true
+        type: choice
+        options:
+          - api
+          - performance
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Executar testes de ${{ inputs.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependências da API
+        run: npm ci
+
+      - name: Iniciar API para os testes
+        id: api_start
+        if: inputs.suite == 'api'
+        shell: bash
+        run: |
+          mkdir -p test-results/api/controller test-results/api/external
+          nohup node rest/server.js > "$RUNNER_TEMP/pets-api.log" 2>&1 < /dev/null &
+          api_pid=$!
+          echo "$api_pid" > "$RUNNER_TEMP/pets-api.pid"
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:3000/status > /dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "$RUNNER_TEMP/pets-api.log"
+              echo "A API não iniciou dentro do tempo esperado."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "API pronta em http://localhost:3000"
+
+      - name: Executar testes de controller
+        id: api_controller
+        if: inputs.suite == 'api'
+        run: >-
+          npm run test-rest-controller --
+          --reporter-options
+          reportDir=test-results/api/controller,reportFilename=results,overwrite=true,html=true,json=true
+
+      - name: Executar testes externos da API
+        id: api_external
+        if: always() && inputs.suite == 'api' && steps.api_start.outcome == 'success'
+        env:
+          BASE_URL_REST: http://localhost:3000
+        run: >-
+          npm run test-rest-external --
+          --reporter-options
+          reportDir=test-results/api/external,reportFilename=results,overwrite=true,html=true,json=true
+
+      - name: Encerrar API de teste
+        if: always() && inputs.suite == 'api'
+        run: |
+          if [ -f "$RUNNER_TEMP/pets-api.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/pets-api.pid")" 2>/dev/null || true
+          fi
+
+      - name: Resumo dos testes da API
+        if: always() && inputs.suite == 'api'
+        env:
+          CONTROLLER_RESULT: ${{ steps.api_controller.outcome }}
+          EXTERNAL_RESULT: ${{ steps.api_external.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          suites = [
+              ("Controller", "test-results/api/controller/results.json", os.environ["CONTROLLER_RESULT"]),
+              ("Externa", "test-results/api/external/results.json", os.environ["EXTERNAL_RESULT"]),
+          ]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Resultado: API Tests\n\n")
+              summary.write("| Suíte | Status | Testes | Passaram | Falharam | Pendentes | Duração |\n")
+              summary.write("| --- | --- | ---: | ---: | ---: | ---: | ---: |\n")
+
+              totals = {"tests": 0, "passes": 0, "failures": 0, "pending": 0, "duration": 0}
+              for name, report_path, outcome in suites:
+                  path = Path(report_path)
+                  if path.exists():
+                      report = json.loads(path.read_text(encoding="utf-8"))
+                      stats = report["stats"]
+                      for key in totals:
+                          totals[key] += stats.get(key, 0)
+                      summary.write(
+                          f"| {name} | {outcome} | {stats['tests']} | {stats['passes']} "
+                          f"| {stats['failures']} | {stats['pending']} | {stats['duration']} ms |\n"
+                      )
+
+                      failed_tests = []
+                      pending_tests = []
+
+                      def collect_tests(suite):
+                          for test in suite.get("tests", []):
+                              if test.get("state") == "failed":
+                                  failed_tests.append(test)
+                              elif test.get("pending"):
+                                  pending_tests.append(test)
+                          for child in suite.get("suites", []):
+                              collect_tests(child)
+
+                      for root_suite in report.get("results", []):
+                          collect_tests(root_suite)
+
+                      for failed_test in failed_tests:
+                          message = failed_test.get("err", {}).get("message", "Falha sem mensagem")
+                          summary.write(
+                              f"\n- **Falha ({name}):** {failed_test.get('fullTitle', failed_test['title'])} — "
+                              f"{message.splitlines()[0]}\n"
+                          )
+                  else:
+                      summary.write(f"| {name} | {outcome} | — | — | — | — | — |\n")
+
+              summary.write(
+                  f"| **Total** | — | **{totals['tests']}** | **{totals['passes']}** "
+                  f"| **{totals['failures']}** | **{totals['pending']}** "
+                  f"| **{totals['duration']} ms** |\n"
+              )
+          PY
+
+      - name: Publicar relatórios da API
+        if: always() && inputs.suite == 'api'
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-results
+          path: test-results/api/
+          if-no-files-found: ignore
+
+      - name: Configurar Java
+        if: inputs.suite == 'performance'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar JMeter e plugin de carga aberta
+        if: inputs.suite == 'performance'
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz \
+            --output "$RUNNER_TEMP/apache-jmeter.tgz"
+          tar -xzf "$RUNNER_TEMP/apache-jmeter.tgz" -C "$RUNNER_TEMP"
+          jmeter_home="$RUNNER_TEMP/apache-jmeter-5.6.3"
+
+          curl --fail --location --silent --show-error \
+            https://jmeter-plugins.org/get/ \
+            --output "$jmeter_home/lib/ext/jmeter-plugins-manager-2.0.jar"
+          curl --fail --location --silent --show-error \
+            https://repo.maven.apache.org/maven2/kg/apc/cmdrunner/2.3/cmdrunner-2.3.jar \
+            --output "$jmeter_home/lib/cmdrunner-2.3.jar"
+
+          java -cp "$jmeter_home/lib/ext/jmeter-plugins-manager-2.0.jar" \
+            org.jmeterplugins.repository.PluginManagerCMDInstaller
+          "$jmeter_home/bin/PluginsManagerCMD.sh" install jpgc-casutg
+          echo "$jmeter_home/bin" >> "$GITHUB_PATH"
+
+      - name: Executar teste de performance
+        id: performance
+        if: inputs.suite == 'performance'
+        shell: bash
+        run: |
+          node rest/server.js > "$RUNNER_TEMP/pets-api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:3000/status > /dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "$RUNNER_TEMP/pets-api.log"
+              echo "A API não iniciou dentro do tempo esperado."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          mkdir -p test-results
+          if ! jmeter -n \
+              -t test/performance/jmeter/pets-performance.jmx \
+              -l test-results/pets-performance.jtl \
+              -j "$RUNNER_TEMP/jmeter.log" \
+              > "$RUNNER_TEMP/jmeter-console.log" 2>&1; then
+            cat "$RUNNER_TEMP/jmeter-console.log"
+            exit 1
+          fi
+          tail -n 8 "$RUNNER_TEMP/jmeter-console.log"
+
+      - name: Resumo do teste de performance
+        if: always() && inputs.suite == 'performance'
+        env:
+          PERFORMANCE_RESULT: ${{ steps.performance.outcome }}
+        run: |
+          python3 - <<'PY'
+          import csv
+          import math
+          import os
+          import sys
+          from collections import defaultdict
+
+          result_path = "test-results/pets-performance.jtl"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Resultado: teste de performance (JMeter)\n\n")
+              summary.write(f"Execução do JMeter: **{os.environ['PERFORMANCE_RESULT']}**\n\n")
+
+              if not os.path.exists(result_path):
+                  summary.write("O arquivo JTL não foi gerado; consulte os logs da etapa do JMeter.\n")
+                  sys.exit(0)
+
+              with open(result_path, newline="", encoding="utf-8") as results_file:
+                  results = list(csv.DictReader(results_file))
+
+              if not results:
+                  summary.write("Nenhuma amostra foi gravada no arquivo JTL.\n")
+                  sys.exit(1)
+
+              grouped = defaultdict(list)
+              failures = []
+              for result in results:
+                  thread_name = result.get("threadName", "")
+                  load_type = "Carga aberta" if thread_name.startswith("Carga Aberta") else "Carga fechada"
+                  grouped[(load_type, result.get("label", "Sem nome"))].append(result)
+                  if result.get("success", "").lower() != "true":
+                      failures.append(result)
+
+              summary.write(f"Amostras: **{len(results)}** · Falhas: **{len(failures)}**\n\n")
+              summary.write("| Modelo de carga | Requisição | Amostras | Falhas | Média (ms) | P90 (ms) | P95 (ms) | Máximo (ms) |\n")
+              summary.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+
+              for (load_type, label), samples in sorted(grouped.items()):
+                  durations = sorted(int(sample.get("elapsed", 0) or 0) for sample in samples)
+                  p90 = durations[max(0, math.ceil(len(durations) * 0.90) - 1)]
+                  p95 = durations[max(0, math.ceil(len(durations) * 0.95) - 1)]
+                  average = round(sum(durations) / len(durations), 2)
+                  sample_failures = sum(sample.get("success", "").lower() != "true" for sample in samples)
+                  summary.write(
+                      f"| {load_type} | {label} | {len(samples)} | {sample_failures} "
+                      f"| {average} | {p90} | {p95} | {max(durations)} |\n"
+                  )
+
+              if failures:
+                  summary.write("\n### Falhas\n\n")
+                  for failure in failures[:20]:
+                      summary.write(
+                          f"- **{failure.get('threadName')} / {failure.get('label')}** — "
+                          f"HTTP {failure.get('responseCode')}: "
+                          f"{failure.get('failureMessage') or failure.get('responseMessage')}\n"
+                      )
+
+          print(f"Amostras: {len(results)}; falhas: {len(failures)}")
+          if failures:
+              sys.exit(1)
+          PY
+
+      - name: Publicar resultados do teste de performance
+        if: always() && inputs.suite == 'performance'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-results
+          path: test-results/pets-performance.jtl
+          if-no-files-found: ignore
